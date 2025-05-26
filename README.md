@@ -108,3 +108,13 @@ MAU В Авито - 50 миллионов человек. Для каждого 
 2. В конкурсе Avito ML Cup 2025 это основная метрика.
 
 ![Примерная схема решения](source_images/schema.png)
+
+## Запуск
+python src/app.py
+python example.py
+
+или
+
+docker build -t rec_service .
+sudo docker run -p 8080:8080 rec_service
+python example.py

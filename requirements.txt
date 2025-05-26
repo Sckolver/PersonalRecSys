@@ -1,0 +1,12 @@
+aiohttp
+uvloop
+orjson
+polars
+numpy
+pandas
+scipy
+implicit
+catboost
+tqdm
+pyarrow
+httpx

@@ -10,3 +10,4 @@ catboost
 tqdm
 pyarrow
 httpx
+streamlit

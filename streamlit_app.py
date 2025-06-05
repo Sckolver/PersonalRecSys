@@ -4,7 +4,7 @@ import httpx
 import asyncio
 import json
 
-RECOMMEND_URL = "http://localhost:8080/recommend"
+RECOMMEND_URL = "http://localhost:8080/recommend_cached_sasrec"
 
 
 def parse_cookies(raw: str) -> List[str]:

@@ -208,7 +208,7 @@ async def init_app() -> web.Application:
         handle_cached_sasrec_recommend
     )
 
-    artifacts = os.getenv("ARTIFACTS_DIR", "artifacts")
+    artifacts = '/app/artifacts'
 
     app["als_model"] = AlternatingLeastSquares.load(
         os.path.join(artifacts, "als_model.npz")

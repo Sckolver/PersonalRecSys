@@ -1,10 +1,14 @@
 from typing import List
+from dotenv import load_dotenv
 import streamlit as st
 import httpx
 import asyncio
 import json
+import os
 
-RECOMMEND_URL = "http://localhost:8080/recommend_cached_sasrec"
+load_dotenv()
+
+RECOMMEND_URL = os.getenv("RECOMMEND_URL", "http://backend:8080/recommend_cached_sasrec")
 
 
 def parse_cookies(raw: str) -> List[str]:

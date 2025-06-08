@@ -1,22 +1,10 @@
-#!/usr/bin/env python3
-# coding: utf-8
-"""
-Оптимизированный микросервис персональных рекомендаций Авито.
-"""
-
-# -- окружение -------------------------------------------------------------- #
 import os
 
-# отключаем внутренний ThreadPool OpenBLAS до любых импортов numpy/implicit
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-
-# -- stdlib & typing -------------------------------------------------------- #
 import asyncio
-import json
 import pickle
 from typing import Any, Dict, List, Tuple
 
-# -- external libs --------------------------------------------------------- #
 import numpy as np
 import orjson
 import polars as pl
@@ -25,12 +13,6 @@ from aiohttp import web
 from catboost import CatBoostRanker, Pool
 from implicit.cpu.als import AlternatingLeastSquares
 from scipy.sparse import load_npz
-
-# -------------------------------------------------------------------------- #
-#                      ───────────────────────────────────
-#                        ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-#                      ───────────────────────────────────
-# -------------------------------------------------------------------------- #
 
 HEADERS_JSON = {"Content-Type": "application/json"}
 
@@ -70,7 +52,6 @@ def als_batch(
     Запрашиваем рекомендации ALS сразу пачкой и разворачиваем
     в плоские массивы для последующей обработки.
     """
-    # user-индексы внутри матрицы
     idx = np.fromiter((u2i[u] for u in users), dtype=np.int32, count=len(users))
 
     recs, scores = model.recommend(
@@ -100,20 +81,10 @@ def assemble_features(
     минуя Pandas/Polars — быстро и без GIL.
     """
     n = len(cookies)
-    # признаки cookie
     cookie_stack = np.vstack([cookie_f[c] for c in cookies])
-    # признаки объявления
     node_stack = np.vstack([node_f[n_] for n_ in nodes])
-    # итоговая матрица
     X = np.hstack([als_score.reshape(n, 1), cookie_stack, node_stack])
     return X
-
-
-# -------------------------------------------------------------------------- #
-#                      ───────────────────────────────────
-#                         ОБРАБОТЧИКИ   HTTP
-#                      ───────────────────────────────────
-# -------------------------------------------------------------------------- #
 
 
 async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Response:
@@ -121,7 +92,6 @@ async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Res
     Главный эндпоинт. `use_sasrec_cached=True` — вариант с дополнительными
     кандидатами из заранее вычисленного SASRec.
     """
-    # 1. Разбираем тело запроса
     try:
         body = await req.json(loads=orjson.loads)
     except ValueError:
@@ -133,10 +103,8 @@ async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Res
     if not cookies:
         return jresp({"recommendations": {}})
 
-    # ------------------------------------------------------------ #
     loop = asyncio.get_running_loop()
 
-    # 2. ALS-рекомендации и векторизация в executor-потоке
     cookies_np, nodes_np, als_score = await loop.run_in_executor(
         None,
         als_batch,
@@ -148,7 +116,6 @@ async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Res
         req.app["als_N_cand"],
     )
 
-    # 3. Подбираем признаки
     node_features = req.app["node_f"]
     X = assemble_features(
         cookies_np,
@@ -158,14 +125,12 @@ async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Res
         node_features,
     )
 
-    # 4. Предсказание CatBoost — тоже в executor, чтобы не блокировать loop
     preds = await loop.run_in_executor(
         None,
         lambda: req.app["cb"].predict(Pool(X, group_id=cookies_np)),
     )
 
-    # 5. Сортировка и top-k
-    order = np.lexsort((-preds, cookies_np))  # по cookie asc, score desc
+    order = np.lexsort((-preds, cookies_np))
     cookies_sorted = cookies_np[order]
     nodes_sorted = nodes_np[order]
     top_k = req.app["top_k"]
@@ -179,35 +144,24 @@ async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Res
     return jresp({"recommendations": result})
 
 
-# -------------------------------------------------------------------------- #
-#                      ───────────────────────────────────
-#                                  APP
-#                      ───────────────────────────────────
-# -------------------------------------------------------------------------- #
-
-
 async def init_app() -> web.Application:
     """Инициализация aiohttp-приложения и загрузка артефактов."""
     art = "/app/artifacts"
     app = web.Application()
-    # маршруты
     app.router.add_post("/recommend", lambda r: handle_recommend(r, False))
     app.router.add_post(
         "/recommend_cached_sasrec",
         lambda r: handle_recommend(r, True),
     )
 
-    # ---------- модели ---------------------------------------------------- #
     app["als_model"] = AlternatingLeastSquares.load(os.path.join(art, "als_model.npz"))
     app["als_mat"] = load_npz(os.path.join(art, "user_item_mat.npz"))
 
-    # ---------- словари индексов ----------------------------------------- #
     with open(os.path.join(art, "u2i.pkl"), "rb") as f:
         app["u2i"]: Dict[Any, int] = pickle.load(f)
     with open(os.path.join(art, "i2n.pkl"), "rb") as f:
         i2n_dict: Dict[int, Any] = pickle.load(f)
 
-    # превращаем i2n в плотный массив для векторного np.take
     max_idx = max(i2n_dict)
     i2n_arr = np.empty(max_idx + 1, dtype=object)
     for idx, node in i2n_dict.items():
@@ -216,26 +170,17 @@ async def init_app() -> web.Application:
 
     app["cookie_type"] = type(next(iter(app["u2i"].keys())))
 
-    # ---------- фичи пользователей и объявлений -------------------------- #
     def parquet_to_dict(path: str, key_col: str) -> Dict[Any, np.ndarray]:
         df = pl.read_parquet(path)
-        # df.rows() → list[tuple], df.rows(named=True) → list[dict]
-        return {
-            row[0]: np.asarray(row[1:], dtype=np.float32)
-            for row in df.rows()
-        }
+        return {row[0]: np.asarray(row[1:], dtype=np.float32) for row in df.rows()}
 
     app["cookie_f"] = parquet_to_dict(os.path.join(art, "cookie_f.parquet"), "cookie")
     app["node_f"] = parquet_to_dict(os.path.join(art, "node_f.parquet"), "node")
 
-    # (если нужно — подгрузите и SASRec-фичи тем же способом)
-
-    # ---------- CatBoost -------------------------------------------------- #
     cb = CatBoostRanker()
     cb.load_model(os.path.join(art, "catboost_model.cbm"))
     app["cb"] = cb
 
-    # ---------- служебные параметры -------------------------------------- #
     app["als_N_cand"] = int(os.getenv("ALS_N_CAND", 339))
     app["top_k"] = int(os.getenv("TOP_K", 40))
 

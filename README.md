@@ -2,16 +2,7 @@
 
 ## Запуск
 ```commandline
-python src/app.py
-python example.py
-```
-
-или
-
-```commandline
-docker build -t rec_service .
-sudo docker run -p 8080:8080 rec_service
-python example.py
+docker compose up --build -d
 ```
 
 [Ссылка](http://62.84.116.179:8501/) на развернутый сервис на виртуальной машине

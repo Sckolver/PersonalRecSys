@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import asyncio
 import pickle
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import numpy as np
 import orjson
@@ -17,12 +17,12 @@ from scipy.sparse import load_npz
 HEADERS_JSON = {"Content-Type": "application/json"}
 
 
-def jresp(obj: Dict[str, Any], status: int = 200) -> web.Response:
+def jresp(obj: dict[str, Any], status: int = 200) -> web.Response:
     """Быстрый JSON-ответ через orjson (без лишней копии)."""
     return web.Response(body=orjson.dumps(obj), status=status, headers=HEADERS_JSON)
 
 
-def parse_cookies(body: Dict[str, Any], key_type, known_set) -> Tuple[List[Any], str]:
+def parse_cookies(body: dict[str, Any], key_type, known_set) -> tuple[list[Any], str]:
     """
     Проверяем/преобразуем список cookies из запроса.
     Возвращает: (список найденных в модели cookies, текст ошибки | None)
@@ -43,11 +43,11 @@ def parse_cookies(body: Dict[str, Any], key_type, known_set) -> Tuple[List[Any],
 def als_batch(
     model: AlternatingLeastSquares,
     mat,
-    u2i: Dict[Any, int],
+    u2i: dict[Any, int],
     i2n_arr: np.ndarray,
-    users: List[Any],
+    users: list[Any],
     top_n: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Запрашиваем рекомендации ALS сразу пачкой и разворачиваем
     в плоские массивы для последующей обработки.
@@ -73,8 +73,8 @@ def assemble_features(
     cookies: np.ndarray,
     nodes: np.ndarray,
     als_score: np.ndarray,
-    cookie_f: Dict[Any, np.ndarray],
-    node_f: Dict[Any, np.ndarray],
+    cookie_f: dict[Any, np.ndarray],
+    node_f: dict[Any, np.ndarray],
 ) -> np.ndarray:
     """
     Склейка всех признаков (als_score + cookie_f + node_f) в один NumPy-матрицу,
@@ -135,7 +135,7 @@ async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Res
     nodes_sorted = nodes_np[order]
     top_k = req.app["top_k"]
 
-    result: Dict[str, List[Any]] = {str(c): [] for c in cookies}
+    result: dict[str, list[Any]] = {str(c): [] for c in cookies}
     for c, n in zip(cookies_sorted, nodes_sorted):
         lst = result[str(c)]
         if len(lst) < top_k:
@@ -158,9 +158,9 @@ async def init_app() -> web.Application:
     app["als_mat"] = load_npz(os.path.join(art, "user_item_mat.npz"))
 
     with open(os.path.join(art, "u2i.pkl"), "rb") as f:
-        app["u2i"]: Dict[Any, int] = pickle.load(f)
+        app["u2i"]: dict[Any, int] = pickle.load(f)
     with open(os.path.join(art, "i2n.pkl"), "rb") as f:
-        i2n_dict: Dict[int, Any] = pickle.load(f)
+        i2n_dict: dict[int, Any] = pickle.load(f)
 
     max_idx = max(i2n_dict)
     i2n_arr = np.empty(max_idx + 1, dtype=object)
@@ -170,7 +170,7 @@ async def init_app() -> web.Application:
 
     app["cookie_type"] = type(next(iter(app["u2i"].keys())))
 
-    def parquet_to_dict(path: str, key_col: str) -> Dict[Any, np.ndarray]:
+    def parquet_to_dict(path: str, key_col: str) -> dict[Any, np.ndarray]:
         df = pl.read_parquet(path)
         return {row[0]: np.asarray(row[1:], dtype=np.float32) for row in df.rows()}
 

@@ -1,7 +1,9 @@
-import json
 import os
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+import asyncio
 import pickle
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import numpy as np
 import orjson
@@ -12,229 +14,172 @@ from catboost import CatBoostRanker, Pool
 from implicit.cpu.als import AlternatingLeastSquares
 from scipy.sparse import load_npz
 
-
-def recommend_als(
-    model: AlternatingLeastSquares,
-    mat,
-    u2i: Dict[Any, int],
-    i2n: Dict[int, Any],
-    users: List[Any],
-    n_cand: int,
-) -> pl.DataFrame:
-    idx = [u2i[u] for u in users]
-    recs, scores = model.recommend(
-        userid=idx, user_items=mat[idx], N=n_cand, filter_already_liked_items=True
-    )
-    return pl.DataFrame(
-        {
-            "cookie": np.repeat(users, n_cand),
-            "node": np.concatenate([[i2n[j] for j in r] for r in recs]),
-            "als_score": np.concatenate(scores),
-        }
-    )
+HEADERS_JSON = {"Content-Type": "application/json"}
 
 
-def recommend_cached_sasrec(
-    cached_sasrec_data: pl.DataFrame,
-    cookies: List[Any]
-) -> pl.DataFrame:
-
-    sasrec_ranked_df = cached_sasrec_data.filter(
-        pl.col('cookie').is_in(cookies)
-    )
-
-    return sasrec_ranked_df
+def jresp(obj: dict[str, Any], status: int = 200) -> web.Response:
+    """Быстрый JSON-ответ через orjson (без лишней копии)."""
+    return web.Response(body=orjson.dumps(obj), status=status, headers=HEADERS_JSON)
 
 
-def get_cands(
-    als_recommended: pl.DataFrame,
-    sasrec_recommended: pl.DataFrame        
-) -> pl.DataFrame:
-
-    df_cands = (
-        als_recommended
-        .join(
-            sasrec_recommended,
-            on=['cookie', 'node'],
-            how='full',
-            coalesce=True
-        )
-    )
-
-    return df_cands
-
-
-def parse_cookies(
-    body: Dict[str, Any],
-    key_type,
-    u2i: Dict[Any, int],
-) -> Tuple[List[Any], web.Response | None]:
-    cookies = body.get("cookies")
-    if not isinstance(cookies, list) or not cookies:
-        return [], web.json_response(
-            {"error": "cookies must be non-empty list"}, status=400
-        )
+def parse_cookies(body: dict[str, Any], key_type, known_set) -> tuple[list[Any], str]:
+    """
+    Проверяем/преобразуем список cookies из запроса.
+    Возвращает: (список найденных в модели cookies, текст ошибки | None)
+    """
+    cookies_raw = body.get("cookies")
+    if not isinstance(cookies_raw, list) or not cookies_raw:
+        return [], "cookies must be non-empty list"
 
     try:
-        cookies = [key_type(c) for c in cookies]
-    except (ValueError, TypeError):
-        pass
+        cookies = [key_type(c) for c in cookies_raw]
+    except Exception:
+        return [], "wrong cookie dtype"
 
-    known = [c for c in cookies if c in u2i]
-    if not known:
-        return [], web.json_response({"recommendations": {}})
-
+    known = [c for c in cookies if c in known_set]
     return known, None
 
 
-async def handle_cached_sasrec_recommend(
-    request: web.Request
-) -> web.Response:
+def als_batch(
+    model: AlternatingLeastSquares,
+    mat,
+    u2i: dict[Any, int],
+    i2n_arr: np.ndarray,
+    users: list[Any],
+    top_n: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Запрашиваем рекомендации ALS сразу пачкой и разворачиваем
+    в плоские массивы для последующей обработки.
+    """
+    idx = np.fromiter((u2i[u] for u in users), dtype=np.int32, count=len(users))
+
+    recs, scores = model.recommend(
+        userid=idx,
+        user_items=mat[idx],
+        N=top_n,
+        filter_already_liked_items=True,
+    )
+
+    recs_flat: np.ndarray = np.asarray(recs).ravel()
+    cookies_rep = np.repeat(np.asarray(users), top_n)
+    scores_flat = np.asarray(scores).ravel()
+    nodes_flat: np.ndarray = np.take(i2n_arr, recs_flat)
+
+    return cookies_rep, nodes_flat, scores_flat
+
+
+def assemble_features(
+    cookies: np.ndarray,
+    nodes: np.ndarray,
+    als_score: np.ndarray,
+    cookie_f: dict[Any, np.ndarray],
+    node_f: dict[Any, np.ndarray],
+) -> np.ndarray:
+    """
+    Склейка всех признаков (als_score + cookie_f + node_f) в один NumPy-матрицу,
+    минуя Pandas/Polars — быстро и без GIL.
+    """
+    n = len(cookies)
+    cookie_stack = np.vstack([cookie_f[c] for c in cookies])
+    node_stack = np.vstack([node_f[n_] for n_ in nodes])
+    X = np.hstack([als_score.reshape(n, 1), cookie_stack, node_stack])
+    return X
+
+
+async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Response:
+    """
+    Главный эндпоинт. `use_sasrec_cached=True` — вариант с дополнительными
+    кандидатами из заранее вычисленного SASRec.
+    """
     try:
-        body = await request.json(loads=orjson.loads)
+        body = await req.json(loads=orjson.loads)
     except ValueError:
-        return web.json_response({"error": "invalid json"}, status=400)
+        return jresp({"error": "invalid json"}, 400)
 
-    known, error_response = parse_cookies(
-        body,
-        request.app["cookie_type"],
-        request.app["u2i"]
-    )
-    if error_response:
-        return error_response
+    cookies, err = parse_cookies(body, req.app["cookie_type"], req.app["u2i"])
+    if err:
+        return jresp({"error": err}, 400)
+    if not cookies:
+        return jresp({"recommendations": {}})
 
-    als_recs = recommend_als(
-        model=request.app["als_model"],
-        mat=request.app["als_mat"],
-        u2i=request.app["u2i"],
-        i2n=request.app["i2n"],
-        users=known,
-        n_cand=request.app["als_N_cand"],
-    )
+    loop = asyncio.get_running_loop()
 
-    cached_sasrec_recs = recommend_cached_sasrec(
-        request.app['sasrec_cached'],
-        cookies=known
+    cookies_np, nodes_np, als_score = await loop.run_in_executor(
+        None,
+        als_batch,
+        req.app["als_model"],
+        req.app["als_mat"],
+        req.app["u2i"],
+        req.app["i2n_arr"],
+        cookies,
+        req.app["als_N_cand"],
     )
 
-    df_cand = get_cands(
-        als_recs, cached_sasrec_recs
+    node_features = req.app["node_f"]
+    X = assemble_features(
+        cookies_np,
+        nodes_np,
+        als_score,
+        req.app["cookie_f"],
+        node_features,
     )
 
-    df_cand = (
-        df_cand.join(request.app["cookie_f"], on="cookie", how="left")
-        .join(request.app["node_f"], on="node", how="left")
-        .fill_null(0)
+    preds = await loop.run_in_executor(
+        None,
+        lambda: req.app["cb"].predict(Pool(X, group_id=cookies_np)),
     )
 
-    feats = request.app["feats"]
-    df_pd = df_cand.select(feats).to_pandas()
-    df_pd = df_pd.sort_values("cookie")
-    pool = Pool(df_pd.drop(columns=["cookie"]), group_id=df_pd["cookie"].to_numpy())
+    order = np.lexsort((-preds, cookies_np))
+    cookies_sorted = cookies_np[order]
+    nodes_sorted = nodes_np[order]
+    top_k = req.app["top_k"]
 
-    scores = request.app["cb_ranker"].predict(pool)
-    df_cand = df_cand.with_columns(pl.Series(scores).alias("score"))
+    result: dict[str, list[Any]] = {str(c): [] for c in cookies}
+    for c, n in zip(cookies_sorted, nodes_sorted):
+        lst = result[str(c)]
+        if len(lst) < top_k:
+            lst.append(n)
 
-    df_top = (
-        df_cand.sort(["cookie", "score"], descending=[False, True])
-        .group_by("cookie")
-        .head(request.app["top_k"])
-    )
-
-    result = {
-        str(c): df_top.filter(pl.col("cookie") == c)["node"].to_list()
-        for c in known
-    }
-
-    return web.json_response({"recommendations": result})
-
-
-async def handle_recommend(request: web.Request) -> web.Response:
-    try:
-        body = await request.json(loads=orjson.loads)
-    except ValueError:
-        return web.json_response({"error": "invalid json"}, status=400)
-
-    known, error_response = parse_cookies(
-        body,
-        request.app["cookie_type"],
-        request.app["u2i"]
-    )
-
-    if error_response:
-        return error_response
-
-    df_cand = recommend_als(
-        model=request.app["als_model"],
-        mat=request.app["als_mat"],
-        u2i=request.app["u2i"],
-        i2n=request.app["i2n"],
-        users=known,
-        n_cand=request.app["als_N_cand"],
-    )
-
-    df_cand = (
-        df_cand.join(request.app["cookie_f"], on="cookie", how="left")
-        .join(request.app["node_f"], on="node", how="left")
-        .fill_null(0)
-    )
-
-    feats = request.app["feats"]
-    df_pd = df_cand.select(feats).to_pandas()
-    pool = Pool(df_pd.drop(columns=["cookie"]), group_id=df_pd["cookie"].to_numpy())
-
-    scores = request.app["cb_ranker"].predict(pool)
-    df_cand = df_cand.with_columns(pl.Series(scores).alias("score"))
-
-    df_top = (
-        df_cand.sort(["cookie", "score"], descending=[False, True])
-        .group_by("cookie")
-        .head(request.app["top_k"])
-    )
-
-    result = {
-        str(c): df_top.filter(pl.col("cookie") == c)["node"].to_list()
-        for c in known
-    }
-
-    return web.json_response({"recommendations": result})
+    return jresp({"recommendations": result})
 
 
 async def init_app() -> web.Application:
+    """Инициализация aiohttp-приложения и загрузка артефактов."""
+    art = "/app/artifacts"
     app = web.Application()
-    app.router.add_post("/recommend", handle_recommend)
+    app.router.add_post("/recommend", lambda r: handle_recommend(r, False))
     app.router.add_post(
-        '/recommend_cached_sasrec',
-        handle_cached_sasrec_recommend
+        "/recommend_cached_sasrec",
+        lambda r: handle_recommend(r, True),
     )
 
-    artifacts = '/app/artifacts'
+    app["als_model"] = AlternatingLeastSquares.load(os.path.join(art, "als_model.npz"))
+    app["als_mat"] = load_npz(os.path.join(art, "user_item_mat.npz"))
 
-    app["als_model"] = AlternatingLeastSquares.load(
-        os.path.join(artifacts, "als_model.npz")
-    )
-    app["als_mat"] = load_npz(os.path.join(artifacts, "user_item_mat.npz"))
+    with open(os.path.join(art, "u2i.pkl"), "rb") as f:
+        app["u2i"]: dict[Any, int] = pickle.load(f)
+    with open(os.path.join(art, "i2n.pkl"), "rb") as f:
+        i2n_dict: dict[int, Any] = pickle.load(f)
 
-    with open(os.path.join(artifacts, "u2i.pkl"), "rb") as f:
-        app["u2i"] = pickle.load(f)
-    with open(os.path.join(artifacts, "i2n.pkl"), "rb") as f:
-        app["i2n"] = pickle.load(f)
+    max_idx = max(i2n_dict)
+    i2n_arr = np.empty(max_idx + 1, dtype=object)
+    for idx, node in i2n_dict.items():
+        i2n_arr[idx] = node
+    app["i2n_arr"] = i2n_arr
 
     app["cookie_type"] = type(next(iter(app["u2i"].keys())))
 
-    app['sasrec_cached'] = pl.read_parquet(
-        os.path.join(artifacts, 'sasrec_cached.parquet')
-    )
+    def parquet_to_dict(path: str, key_col: str) -> dict[Any, np.ndarray]:
+        df = pl.read_parquet(path)
+        return {row[0]: np.asarray(row[1:], dtype=np.float32) for row in df.rows()}
+
+    app["cookie_f"] = parquet_to_dict(os.path.join(art, "cookie_f.parquet"), "cookie")
+    app["node_f"] = parquet_to_dict(os.path.join(art, "node_f.parquet"), "node")
 
     cb = CatBoostRanker()
-    cb.load_model(os.path.join(artifacts, "catboost_model.cbm"))
-    app["cb_ranker"] = cb
-
-    app["cookie_f"] = pl.read_parquet(os.path.join(artifacts, "cookie_f.parquet"))
-    app["node_f"] = pl.read_parquet(os.path.join(artifacts, "node_f.parquet"))
-
-    with open(os.path.join(artifacts, "feats.json"), "r") as f:
-        app["feats"] = json.load(f)
+    cb.load_model(os.path.join(art, "catboost_model.cbm"))
+    app["cb"] = cb
 
     app["als_N_cand"] = int(os.getenv("ALS_N_CAND", 339))
     app["top_k"] = int(os.getenv("TOP_K", 40))
@@ -243,9 +188,10 @@ async def init_app() -> web.Application:
 
 
 def main() -> None:
+    """Точка входа."""
+    uvloop.install()
     web.run_app(init_app(), port=int(os.getenv("PORT", 8080)))
 
 
 if __name__ == "__main__":
-    uvloop.install()
     main()

@@ -1,35 +1,27 @@
-from typing import Any, Dict, List, Tuple
-from aiohttp import web
-from catboost import CatBoostRanker, Pool
-from implicit.cpu.als import AlternatingLeastSquares
-from scipy.sparse import load_npz
-
-import os
 import asyncio
+import os
 import pickle
+from typing import Any
+
 import numpy as np
 import orjson
 import polars as pl
 import uvloop
+from aiohttp import web
+from catboost import CatBoostRanker, Pool
+from implicit.cpu.als import AlternatingLeastSquares
+from scipy.sparse import load_npz
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 HEADERS_JSON = {"Content-Type": "application/json"}
 
 
-def jresp(obj: Dict[str, Any], status: int = 200) -> web.Response:
-    return web.Response(
-        body=orjson.dumps(obj),
-        status=status,
-        headers=HEADERS_JSON
-    )
+def jresp(obj: dict[str, Any], status: int = 200) -> web.Response:
+    return web.Response(body=orjson.dumps(obj), status=status, headers=HEADERS_JSON)
 
 
-def parse_cookies(
-    body: Dict[str, Any],
-    key_type,
-    known_set
-) -> Tuple[List[Any], str]:
+def parse_cookies(body: dict[str, Any], key_type, known_set) -> tuple[list[Any], str]:
 
     cookies_raw = body.get("cookies")
     if not isinstance(cookies_raw, list) or not cookies_raw:
@@ -46,17 +38,13 @@ def parse_cookies(
 def als_batch(
     model: AlternatingLeastSquares,
     mat,
-    u2i: Dict[Any, int],
+    u2i: dict[Any, int],
     i2n_arr: np.ndarray,
-    users: List[Any],
+    users: list[Any],
     top_n: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
-    idx = np.fromiter(
-        (u2i[u] for u in users),
-        dtype=np.int32,
-        count=len(users)
-    )
+    idx = np.fromiter((u2i[u] for u in users), dtype=np.int32, count=len(users))
 
     recs, scores = model.recommend(
         userid=idx,
@@ -77,8 +65,8 @@ def assemble_features(
     cookies: np.ndarray,
     nodes: np.ndarray,
     als_score: np.ndarray,
-    cookie_f: Dict[Any, np.ndarray],
-    node_f: Dict[Any, np.ndarray],
+    cookie_f: dict[Any, np.ndarray],
+    node_f: dict[Any, np.ndarray],
 ) -> np.ndarray:
 
     n = len(cookies)
@@ -91,10 +79,7 @@ def assemble_features(
     return X
 
 
-async def handle_recommend(
-    req: web.Request,
-    use_sasrec_cached: bool
-) -> web.Response:
+async def handle_recommend(req: web.Request, use_sasrec_cached: bool) -> web.Response:
     try:
         body = await req.json(loads=orjson.loads)
     except ValueError:
@@ -119,17 +104,15 @@ async def handle_recommend(
     )
 
     if use_sasrec_cached:
-        sasrec_df = req.app["sasrec_cached"].filter(
-            pl.col("cookie").is_in(cookies)
-        )
+        sasrec_df = req.app["sasrec_cached"].filter(pl.col("cookie").is_in(cookies))
 
         sas_cookies = sasrec_df["cookie"].to_numpy()
         sas_nodes = sasrec_df["node"].to_numpy()
         sas_scores = np.zeros(len(sas_cookies), dtype=float)
 
         cookies_np = np.concatenate([cookies_np, sas_cookies])
-        nodes_np = np.concatenate([nodes_np,   sas_nodes])
-        als_score = np.concatenate([als_score,  sas_scores])
+        nodes_np = np.concatenate([nodes_np, sas_nodes])
+        als_score = np.concatenate([als_score, sas_scores])
 
     X = assemble_features(
         cookies_np,
@@ -148,7 +131,7 @@ async def handle_recommend(
     nodes_sorted = nodes_np[order]
     top_k = req.app["top_k"]
 
-    result: Dict[str, List[Any]] = {str(c): [] for c in cookies}
+    result: dict[str, list[Any]] = {str(c): [] for c in cookies}
     for c, n in zip(cookies_sorted, nodes_sorted):
         lst = result[str(c)]
         if len(lst) < top_k:
@@ -157,7 +140,7 @@ async def handle_recommend(
     return jresp({"recommendations": result})
 
 
-def parquet_to_dict(path: str) -> Dict[Any, np.ndarray]:
+def parquet_to_dict(path: str) -> dict[Any, np.ndarray]:
     df = pl.read_parquet(path)
     return {row[0]: np.asarray(row[1:], dtype=np.float32) for row in df.rows()}
 
@@ -169,14 +152,9 @@ async def init_app() -> web.Application:
     art = "/app/artifacts"
     app = web.Application()
     app.router.add_post("/recommend", lambda r: handle_recommend(r, False))
-    app.router.add_post(
-        "/recommend_cached_sasrec",
-        lambda r: handle_recommend(r, True)
-    )
+    app.router.add_post("/recommend_cached_sasrec", lambda r: handle_recommend(r, True))
 
-    app["als_model"] = AlternatingLeastSquares.load(
-        os.path.join(art, "als_model.npz")
-    )
+    app["als_model"] = AlternatingLeastSquares.load(os.path.join(art, "als_model.npz"))
     app["als_mat"] = load_npz(os.path.join(art, "user_item_mat.npz"))
 
     with open(os.path.join(art, "u2i.pkl"), "rb") as f:
@@ -192,9 +170,7 @@ async def init_app() -> web.Application:
     app["i2n_arr"] = arr
     app["cookie_type"] = type(next(iter(app["u2i"].keys())))
 
-    app["sasrec_cached"] = pl.read_parquet(
-        os.path.join(art, "sasrec_cached.parquet")
-    )
+    app["sasrec_cached"] = pl.read_parquet(os.path.join(art, "sasrec_cached.parquet"))
 
     app["cookie_f"] = parquet_to_dict(os.path.join(art, "cookie_f.parquet"))
     app["node_f"] = parquet_to_dict(os.path.join(art, "node_f.parquet"))

@@ -10,3 +10,5 @@ catboost
 tqdm
 pyarrow
 httpx
+streamlit
+python-dotenv
